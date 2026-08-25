@@ -1,0 +1,38 @@
+# Kubernetes Remediation Agent - Configuration Example
+
+# LLM Configuration
+llm:
+  model: "claude-sonnet-5-20241022"  # Latest Claude Sonnet
+  max_tokens: 4096
+  temperature: 0.0
+  timeout_seconds: 30
+
+# Policy Configuration
+policy:
+  # Set to false to allow actual remediations (after testing!)
+  dry_run_only: true
+
+  # Auto-approve low-risk actions without manual approval
+  auto_approve_low_risk: false
+
+  # Rate limiting to prevent cascading fixes
+  rate_limit:
+    max_actions_per_minute: 5
+    max_actions_per_hour: 20
+
+# Watcher Configuration
+watcher:
+  # Namespaces to monitor (use ["*"] for all namespaces)
+  namespaces:
+    - default
+    - production
+
+  # How often to check for failures (seconds)
+  watch_interval_seconds: 30
+
+  # Minimum restart count before considering remediation
+  min_restart_count_threshold: 3
+
+# Logging
+log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+audit_log_path: "logs/audit.jsonl"
