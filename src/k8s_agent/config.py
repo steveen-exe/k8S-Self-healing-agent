@@ -14,7 +14,7 @@ class RateLimitConfig(BaseModel):
 
 class LLMConfig(BaseModel):
     """LLM configuration."""
-    model: str = "claude-sonnet-5-20241022"
+    model: str = "meta/llama-3.2-11b-vision-instruct"
     max_tokens: int = 4096
     temperature: float = 0.0
     timeout_seconds: int = 30
@@ -36,7 +36,9 @@ class WatcherConfig(BaseModel):
 
 class Settings(BaseSettings):
     """Application settings."""
-    anthropic_api_key: str = Field(alias="ANTHROPIC_API_KEY")
+    anthropic_api_key: str = Field(alias="ANTHROPIC_API_KEY", description="API key for Anthropic or fallback")
+    omniroute_api_key: str | None = Field(default=None, alias="OMNIROUTE_API_KEY")
+    omniroute_base_url: str | None = Field(default=None, alias="OMNIROUTE_BASE_URL")
     kubeconfig_path: str | None = None  # None = in-cluster
 
     llm: LLMConfig = Field(default_factory=LLMConfig)
@@ -58,12 +60,21 @@ def load_settings(config_path: Path | None = None) -> Settings:
     if config_path and config_path.exists():
         with open(config_path) as f:
             config_data = yaml.safe_load(f)
-            # Merge YAML config over defaults
+            # Merge YAML config over defaults, handling nested models
             for key, value in config_data.items():
                 if hasattr(settings, key):
-                    setattr(settings, key, value)
+                    current_value = getattr(settings, key)
+                    if isinstance(current_value, BaseModel) and isinstance(value, dict):
+                        # Merge nested Pydantic model
+                        updated_value = current_value.copy(update=value)
+                        setattr(settings, key, updated_value)
+                    else:
+                        setattr(settings, key, value)
 
     # Ensure audit log directory exists
-    settings.audit_log_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_log_path = settings.audit_log_path
+    if not isinstance(audit_log_path, Path):
+        audit_log_path = Path(audit_log_path)
+    audit_log_path.parent.mkdir(parents=True, exist_ok=True)
 
     return settings

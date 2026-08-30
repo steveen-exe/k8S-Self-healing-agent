@@ -3,6 +3,8 @@
 import sys
 import time
 import structlog
+import threading
+import uvicorn
 from pathlib import Path
 
 from k8s_agent.config import load_settings
@@ -11,6 +13,9 @@ from k8s_agent.diagnosis.engine import DiagnosisEngine
 from k8s_agent.policy import PolicyEngine
 from k8s_agent.executor import Executor
 from k8s_agent.audit import AuditLogger
+
+# Import dashboard components to set shared instances
+from k8s_agent.dashboard.api import shared_policy_engine, shared_settings, shared_audit_logger
 
 
 def setup_logging(log_level: str) -> None:
@@ -53,6 +58,25 @@ def main() -> None:
     policy_engine = PolicyEngine(settings)
     executor = Executor(settings)
     audit_logger = AuditLogger(settings)
+
+    # Set shared instances for dashboard
+    from k8s_agent.dashboard.api import shared_policy_engine, shared_settings, shared_audit_logger
+    shared_policy_engine = policy_engine
+    shared_settings = settings
+    shared_audit_logger = audit_logger
+
+    # Start dashboard server in a background thread
+    dashboard_thread = threading.Thread(
+        target=lambda: uvicorn.run(
+            "k8s_agent.dashboard.api:app",
+            host="0.0.0.0",
+            port=8000,
+            log_level="info"
+        ),
+        daemon=True
+    )
+    dashboard_thread.start()
+    logger.info("Dashboard server started on http://0.0.0.0:8000")
 
     # Main watch loop
     while True:

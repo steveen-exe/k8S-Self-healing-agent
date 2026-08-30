@@ -1,7 +1,14 @@
+# """Kubernetes cluster state watcher."""
+
 """Kubernetes cluster state watcher."""
 
 import structlog
-from kubernetes import client, config as k8s_config, watch
+try:
+    from kubernetes import client, config as k8s_config, watch
+except ImportError:  # pragma: no cover
+    client = None
+    k8s_config = None
+    watch = None
 from typing import Iterator
 
 from .types import Symptom, FailureType
@@ -19,12 +26,16 @@ class PodWatcher:
 
     def _setup_k8s_client(self) -> None:
         """Initialize Kubernetes client."""
+        # Ensure the kubernetes client library is available
+        if client is None or k8s_config is None:
+            raise ImportError("kubernetes client library is required for PodWatcher")
+
         if self.settings.kubeconfig_path:
             k8s_config.load_kube_config(config_file=self.settings.kubeconfig_path)
         else:
             try:
                 k8s_config.load_incluster_config()
-            except k8s_config.ConfigException:
+            except Exception:  # pragma: no cover
                 logger.warning("Not running in cluster, loading local kubeconfig")
                 k8s_config.load_kube_config()
 

@@ -1,23 +1,24 @@
-"""LLM-assisted diagnosis fallback using Claude."""
+"""LLM-assisted diagnosis fallback using NVIDIA NIM API (OpenAI-compatible)."""
 
 import json
 import structlog
-import anthropic
+from typing import Dict, Any
 from ..types import Symptom, Diagnosis, FailureType, RemediationType, RiskLevel
 from ..config import Settings
+from ..llm_client import NVIDIAClient
 
 logger = structlog.get_logger()
 
 
 class LLMDiagnoser:
-    """Fallback diagnoser that queries Claude to diagnose complex failures."""
+    """Fallback diagnoser that queries NVIDIA NIM API to diagnose complex failures."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        self.client = NVIDIAClient(settings)
 
     def diagnose(self, symptom: Symptom) -> Diagnosis | None:
-        """Query Claude to diagnose the Kubernetes failure symptom."""
+        """Query NVIDIA NIM API to diagnose the Kubernetes failure symptom."""
         logger.info(
             "Querying LLM for fallback diagnosis",
             pod=symptom.pod_name,
@@ -26,86 +27,49 @@ class LLMDiagnoser:
 
         prompt = self._build_prompt(symptom)
 
-        # Definition of diagnosis tool to force structured output
-        tools = [
-            {
-                "name": "report_diagnosis",
-                "description": "Report the diagnosis and remediation steps for the container failure",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "root_cause": {
-                            "type": "string",
-                            "description": "Clear explanation of why the container failed/crashed.",
-                        },
-                        "remediation_type": {
-                            "type": "string",
-                            "enum": [member.value for member in RemediationType],
-                            "description": "Recommended remediation type.",
-                        },
-                        "remediation_params": {
-                            "type": "object",
-                            "description": "Arguments/params for remediation (e.g. memory_increase_factor, target_image_tag). Keys depend on remediation_type.",
-                        },
-                        "risk_level": {
-                            "type": "string",
-                            "enum": [member.value for member in RiskLevel],
-                            "description": "Level of operational risk associated with this remediation.",
-                        },
-                        "confidence": {
-                            "type": "number",
-                            "minimum": 0.0,
-                            "maximum": 1.0,
-                            "description": "Confidence score in this diagnosis (0.0 to 1.0).",
-                        },
-                        "reasoning": {
-                            "type": "string",
-                            "description": "Step-by-step reasoning explaining why the root cause and remediation were selected.",
-                        },
-                        "requires_approval": {
-                            "type": "boolean",
-                            "description": "True if executing this remediation requires manual human approval, False if it can be automated.",
-                        },
-                    },
-                    "required": [
-                        "root_cause",
-                        "remediation_type",
-                        "remediation_params",
-                        "risk_level",
-                        "confidence",
-                        "reasoning",
-                        "requires_approval",
-                    ],
-                },
-            }
-        ]
+        # Update prompt to request JSON output
+        json_prompt = prompt + """
+
+    Provide your response as a valid JSON object with the following fields:
+    - root_cause: string
+    - remediation_type: one of ["restart_pod", "increase_memory", "update_image_tag", "rollback_deployment", "no_action"]
+    - remediation_params: object (parameters for the remediation)
+    - risk_level: one of ["low", "medium", "high"]
+    - confidence: number between 0.0 and 1.0
+    - reasoning: string
+    - requires_approval: boolean
+
+    Do not include any additional text outside the JSON object.
+    """
 
         try:
-            response = self.client.messages.create(
-                model=self.settings.llm.model,
-                max_tokens=self.settings.llm.max_tokens,
+            response = self.client.chat_completion(
+                messages=[{"role": "user", "content": json_prompt}],
                 temperature=self.settings.llm.temperature,
-                system=(
-                    "You are an expert Kubernetes reliability engineer. Your job is to analyze log "
-                    "dumps, status reports, and pod event logs to determine the root cause of a pod failure "
-                    "and recommend safe remediation steps. You must invoke the 'report_diagnosis' tool "
-                    "to report your findings."
-                ),
-                messages=[{"role": "user", "content": prompt}],
-                tools=tools,
-                tool_choice={"type": "tool", "name": "report_diagnosis"},
-                timeout=self.settings.llm.timeout_seconds,
+                max_tokens=self.settings.llm.max_tokens,
+                stream=False,
             )
 
-            # Extract structured tool call
-            tool_use = next(
-                (block for block in response.content if block.type == "tool_use"), None
-            )
-            if not tool_use:
-                logger.error("LLM did not invoke the diagnosis tool")
+            # Extract the content from the response
+            content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if not content:
+                logger.error("LLM returned empty content")
                 return None
 
-            result_data = tool_use.input
+            # Parse the JSON content
+            try:
+                result_data = json.loads(content)
+            except json.JSONDecodeError as e:
+                logger.error("Failed to parse LLM response as JSON", error=str(e), content=content[:200])
+                return None
+
+            # Validate required fields
+            required_fields = ["root_cause", "remediation_type", "remediation_params", "risk_level", "confidence", "reasoning", "requires_approval"]
+            for field in required_fields:
+                if field not in result_data:
+                    logger.error(f"Missing required field in LLM response: {field}")
+                    return None
+
             logger.info("Received diagnosis from LLM", root_cause=result_data.get("root_cause"))
 
             return Diagnosis(

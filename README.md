@@ -1,183 +1,119 @@
-# Kubernetes Remediation Agent
+# Kubernetes Remediation Agent with Dashboard
 
-A guardrailed, auditable Kubernetes remediation system that watches cluster state, diagnoses failures, and executes fixes through an independent policy layer.
+A Kubernetes remediation agent that automatically detects and fixes common cluster issues, now with a web dashboard for monitoring and human oversight.
 
-## 🚀 Quick Start
+## Features
 
-### Prerequisites
+- **Automatic Detection**: Watches for failing pods in specified namespaces
+- **Intelligent Diagnosis**: Uses LLM-assisted analysis to identify root causes
+- **Policy-Based Authorization**: Configurable remediation policies with approval workflows
+- **Execution Engine**: Safely executes remediation actions (with dry-run support)
+- **Audit Logging**: Comprehensive logging for compliance and debugging
+- **Web Dashboard**: Real-time monitoring and human approval interface
 
-- Python 3.11+
-- Kubernetes cluster access (kubeconfig or in-cluster)
-- Anthropic API key
+## Dashboard
 
-### Installation
+The agent now includes an embedded web dashboard that provides:
+
+- **Historical Actions**: View past remediation attempts from the audit log
+- **Current Issues**: See currently failing pods being monitored
+- **Pending Approvals**: Review and approve/reject actions requiring human oversight
+- **Real-time Updates**: Frontend polls APIs every 30 seconds for fresh data
+
+Access the dashboard at `http://localhost:8000` when the agent is running.
+
+## Architecture
+
+```
+Main Agent Loop
+    │
+    ├── Watcher → Detects failing pods
+    ├── DiagnosisEngine → Analyzes symptoms and suggests remediations
+    ├── PolicyEngine → Checks authorization (with pending actions tracking)
+    ├── Executor → Performs remediation actions
+    └── AuditLogger → Logs all activities for compliance
+        
+Dashboard (FastAPI Server)
+    │
+    ├── GET /api/historical-actions → Reads from audit log
+    ├── GET /api/current-issues → Gets current failing pods
+    ├── GET /api/pending-approvals → Returns actions needing approval
+    ├── POST /api/approve/{id} → Approves pending action
+    ├── POST /api/reject/{id} → Rejects pending action
+    └── GET / → Serves HTML/JS frontend
+```
+
+## Installation
 
 ```bash
-# Clone the repository
-cd my-ai-agent
-
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
 # Install dependencies
-pip install -e .
+pip install -r requirements.txt
 
-# Copy and configure environment
-cp .env.example .env
-# Edit .env and add your ANTHROPIC_API_KEY
+# Or install individually:
+pip install fastapi uvicorn python-multipart kubernetes anthropic pyyaml structlog python-json-logger pydantic
 ```
 
-### Configuration
+## Configuration
 
-Edit `config/agent.yaml` to customize:
+Create `config/agent.yaml` based on the example structure. The agent will look for this file on startup.
 
-- **Namespaces to monitor** (currently: `default`)
-- **Dry-run mode** (enabled by default for safety)
-- **Rate limits** (5 actions/min, 20/hour)
-- **Restart count threshold** (minimum 3 restarts before action)
+**Note**: When using OmniRoute, the `llm.model` value must include a provider prefix (e.g., "anthropic/claude-sonnet-5-20241022"). Refer to the OmniRoute documentation for the correct format.
 
-### Run the Agent
+## Usage
 
 ```bash
-# Start in dry-run mode (safe - no actual changes)
-python src/agent.py
+# Run the agent (dashboard starts automatically)
+python3 src/agent.py
 
-# The agent will:
-# 1. Watch pods in configured namespaces
-# 2. Detect failures (CrashLoopBackOff, ImagePullBackOff, OOMKilled)
-# 3. Diagnose using rules or Claude LLM fallback
-# 4. Log proposed remediations to logs/audit.jsonl
+# Access dashboard at http://localhost:8000
 ```
 
-## 🎯 Focused Scope (MVP)
+## API Endpoints
 
-This implementation targets **3 common failure modes**:
+- `GET /` - Dashboard HTML interface
+- `GET /health` - Health check
+- `GET /api/historical-actions` - List past remediation actions
+- `GET /api/current-issues` - Show currently monitored failing pods
+- `GET /api/pending-approvals` - List actions requiring human approval
+- `POST /api/approve/{action_id}` - Approve a pending action
+- `POST /api/reject/{action_id}` - Reject a pending action
 
-1. **CrashLoopBackOff** - Detects OOM, panics, connection failures
-2. **ImagePullBackOff** - Identifies auth issues, missing tags, timeouts  
-3. **OOMKilled** - Automatically suggests memory increases
+## Testing
 
-## 🏗️ Architecture
-
-```
-Watcher → Diagnosis Engine → Policy Engine → Executor → Audit Logger
-            ├─ Rule Matcher (fast path)
-            └─ LLM Fallback (Claude API)
-```
-
-### Components
-
-- **[watcher.py](src/k8s_agent/watcher.py)** - Monitors pod failures via Kubernetes API
-- **[diagnosis/engine.py](src/k8s_agent/diagnosis/engine.py)** - Orchestrates diagnosis
-  - **[rules.py](src/k8s_agent/diagnosis/rules.py)** - Fast rule-based pattern matching
-  - **[llm_fallback.py](src/k8s_agent/diagnosis/llm_fallback.py)** - Claude-powered analysis for complex cases
-- **[policy.py](src/k8s_agent/policy.py)** - Authorization and rate limiting
-- **[executor.py](src/k8s_agent/executor.py)** - Executes remediations (restart pod, increase memory, rollback)
-- **[audit.py](src/k8s_agent/audit.py)** - Structured JSONL audit logs
-
-## 🛡️ Safety Features
-
-- ✅ **Dry-run first** - Enabled by default, no changes until you opt-in
-- ✅ **Independent policy layer** - Authorization separate from diagnosis
-- ✅ **Rate limiting** - Prevents cascading fixes (configurable)
-- ✅ **Full audit trail** - Every decision logged to `logs/audit.jsonl`
-- ✅ **Approval gates** - High-risk actions require manual approval
-- ✅ **Rule-based fast path** - LLM only called for complex/unknown failures
-
-## 📊 Example Output
-
-```json
-{
-  "event_type": "diagnosis_completed",
-  "diagnosis": {
-    "symptom": {
-      "namespace": "default",
-      "pod_name": "myapp-7d8f9c-xkj2p",
-      "failure_type": "CrashLoopBackOff",
-      "restart_count": 5
-    },
-    "root_cause": "Container exceeded memory limit and was killed by Kubernetes",
-    "remediation_type": "increase_memory",
-    "remediation_params": {"memory_increase_factor": 1.5},
-    "risk_level": "medium",
-    "confidence": 1.0,
-    "diagnosed_by": "rule_engine"
-  },
-  "timestamp": "2026-08-25T03:01:57.918Z"
-}
-```
-
-## 🔧 Development
-
+Run the validation script:
 ```bash
-# Install dev dependencies
-pip install -e ".[dev]"
-
-# Run type checking
-mypy src/
-
-# Run linter
-ruff check src/
-
-# Run tests (when added)
-pytest
+python3 test_dashboard.py
 ```
 
-## 📝 Configuration Reference
+## Memory & Persistence
 
-### Remediation Types
+Important facts and decisions can be preserved across system sessions using the Claude memory system. To store information for future reference:
 
-- `restart_pod` - Delete pod (controller recreates it)
-- `increase_memory` - Scale memory limits by factor
-- `rollback_deployment` - Revert to previous deployment revision
-- `no_action` - Log diagnosis but take no action
+Simply ask: "Remember that [specific fact you want to preserve]"
 
-### Risk Levels
+Examples:
+- "Remember that I prefer using Sonnet 4 for coding tasks"
+- "Remember that my Kubernetes cluster is in the 'staging' namespace"
+- "Remember that I want all remediations to run in dry-run mode by default"
 
-- `low` - Safe, reversible (e.g., restart pod)
-- `medium` - Some impact (e.g., memory changes)
-- `high` - Significant impact (e.g., rollback)
+These memories are stored as files in:
+```
+/home/user/.claude-omniroute/projects/-home-user-my-ai-agent/memory/
+```
 
-## 🚦 Next Steps
+And indexed in `MEMORY.md` for easy retrieval.
 
-1. **Test in dev cluster** - Run in dry-run mode, review audit logs
-2. **Tune rules** - Adjust pattern matching in [rules.py](src/k8s_agent/diagnosis/rules.py)
-3. **Enable auto-remediation** - Set `dry_run_only: false` for low-risk actions
-4. **Add more failure patterns** - Extend rule matchers as needed
-5. **SIEM integration** - Forward `logs/audit.jsonl` to your logging system
+## Dashboard Screenshots
 
-## ⚠️ Production Checklist
+*(To be added)*
 
-Before deploying to production:
+## Contributing
 
-- [ ] Test all remediation types in staging
-- [ ] Configure appropriate rate limits
-- [ ] Set up audit log forwarding to SIEM
-- [ ] Review and adjust approval gates
-- [ ] Monitor Claude API usage/costs
-- [ ] Set up alerts for authorization denials
-- [ ] Document incident response procedures
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Submit a pull request
 
-## 📚 Tech Stack
-
-- **Python 3.11** with type hints
-- **kubernetes** client library
-- **anthropic** SDK for Claude API
-- **pydantic** for configuration/validation
-- **structlog** for structured logging
-
-## 🤝 Contributing
-
-This is an MVP implementation. Areas for improvement:
-
-- Add comprehensive tests
-- Implement more remediation types
-- Add webhook for manual approval UI
-- Support for StatefulSets, DaemonSets
-- Prometheus metrics export
-- Leader election for HA deployment
-
-## 📄 License
+## License
 
 MIT

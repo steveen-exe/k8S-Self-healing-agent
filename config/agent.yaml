@@ -2,7 +2,9 @@
 
 # LLM Configuration
 llm:
-  model: "claude-sonnet-5-20241022"  # Latest Claude Sonnet
+  # When using OmniRoute, the model string may need a provider prefix like "anthropic/claude-..."
+  # Refer to OmniRoute documentation for the correct format for your model.
+  model: "anthropic/claude-sonnet-5-20241022"  # Example with provider prefix
   max_tokens: 4096
   temperature: 0.0
   timeout_seconds: 30
