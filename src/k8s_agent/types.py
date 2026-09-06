@@ -1,7 +1,7 @@
 """Core domain types for the remediation agent."""
 
 from enum import Enum
-from typing import Any
+from typing import Any, List
 from datetime import datetime
 from pydantic import BaseModel, Field
 
@@ -20,6 +20,8 @@ class RemediationType(str, Enum):
     INCREASE_MEMORY = "increase_memory"
     UPDATE_IMAGE_TAG = "update_image_tag"
     ROLLBACK_DEPLOYMENT = "rollback_deployment"
+    SCALE_DEPLOYMENT = "scale_deployment"
+    ADD_REPLICA = "add_replica"
     NO_ACTION = "no_action"
 
 
@@ -55,6 +57,8 @@ class Diagnosis(BaseModel):
     reasoning: str
     requires_approval: bool = True
     diagnosed_by: str  # "rule_engine" or "llm"
+    suggested_verification_steps: List[str] = Field(default_factory=list)
+    prevention_recommendations: List[str] = Field(default_factory=list)
 
 
 class RemediationResult(BaseModel):

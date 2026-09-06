@@ -39,6 +39,12 @@ class Executor:
                     output = self._increase_memory(diagnosis, dry_run)
                 case RemediationType.ROLLBACK_DEPLOYMENT:
                     output = self._rollback_deployment(diagnosis, dry_run)
+                case RemediationType.SCALE_DEPLOYMENT:
+                    output = self._scale_deployment(diagnosis, dry_run)
+                case RemediationType.ADD_REPLICA:
+                    output = self._add_replica(diagnosis, dry_run)
+                case RemediationType.UPDATE_IMAGE_TAG:
+                    output = self._update_image_tag(diagnosis, dry_run)
                 case RemediationType.NO_ACTION:
                     output = "No action required (diagnosis suggests manual intervention)"
                 case _:
@@ -225,3 +231,88 @@ class Executor:
 
         new_value = int(value * factor)
         return f"{new_value}{unit}"
+
+    def _scale_deployment(self, diagnosis: Diagnosis, dry_run: bool) -> str:
+        """Scale deployment replicas."""
+        symptom = diagnosis.symptom
+        replicas = diagnosis.remediation_params.get("target_replicas", 2)
+
+        if dry_run:
+            return f"[DRY RUN] Would scale deployment to {replicas} replicas"
+
+        deployment = self.apps_v1.read_namespaced_deployment(
+            name=symptom.pod_name.rsplit("-", 2)[0],  # Extract deployment name from pod name
+            namespace=symptom.namespace,
+        )
+        deployment.spec.replicas = replicas
+        self.apps_v1.patch_namespaced_deployment(
+            name=deployment.metadata.name,
+            namespace=symptom.namespace,
+            body=deployment,
+        )
+        return f"Scaled deployment to {replicas} replicas"
+
+    def _add_replica(self, diagnosis: Diagnosis, dry_run: bool) -> str:
+        """Add a single replica (shorthand for scale to +1)."""
+        symptom = diagnosis.symptom
+
+        deployment = self.apps_v1.read_namespaced_deployment(
+            name=symptom.pod_name.rsplit("-", 2)[0],
+            namespace=symptom.namespace,
+        )
+        current_replicas = deployment.spec.replicas or 1
+        target_replicas = current_replicas + 1
+
+        if dry_run:
+            return f"[DRY RUN] Would add replica: {current_replicas} -> {target_replicas}"
+
+        deployment.spec.replicas = target_replicas
+        self.apps_v1.patch_namespaced_deployment(
+            name=deployment.metadata.name,
+            namespace=symptom.namespace,
+            body=deployment,
+        )
+        return f"Added replica: {current_replicas} -> {target_replicas}"
+
+    def _update_image_tag(self, diagnosis: Diagnosis, dry_run: bool) -> str:
+        """Update container image tag in deployment."""
+        symptom = diagnosis.symptom
+        new_tag = diagnosis.remediation_params.get("new_tag", "latest")
+
+        if not new_tag:
+            raise ValueError("new_tag parameter required for UPDATE_IMAGE_TAG")
+
+        deployment = self.apps_v1.read_namespaced_deployment(
+            name=symptom.pod_name.rsplit("-", 2)[0],
+            namespace=symptom.namespace,
+        )
+
+        containers = deployment.spec.template.spec.containers
+        target_container = None
+        for container in containers:
+            if container.name == symptom.container_name:
+                target_container = container
+                break
+
+        if not target_container:
+            raise ValueError(f"Container {symptom.container_name} not found")
+
+        current_image = target_container.image
+        # Replace tag in image string (format: registry/name:tag or name:tag)
+        if ':' in current_image:
+            base_image = current_image.rsplit(':', 1)[0]
+        else:
+            base_image = current_image
+
+        new_image = f"{base_image}:{new_tag}"
+
+        if dry_run:
+            return f"[DRY RUN] Would update image: {current_image} -> {new_image}"
+
+        target_container.image = new_image
+        self.apps_v1.patch_namespaced_deployment(
+            name=deployment.metadata.name,
+            namespace=symptom.namespace,
+            body=deployment,
+        )
+        return f"Updated image: {current_image} -> {new_image}"

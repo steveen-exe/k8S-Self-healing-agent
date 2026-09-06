@@ -1,12 +1,16 @@
-"""FastAPI application for the Kubernetes remediation dashboard."""
+"""FastAPI application for the Kubernetes remediation dashboard with WebSocket support."""
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-from typing import List, Dict, Optional
+from fastapi.staticfiles import StaticFiles
+from typing import List, Dict, Optional, Set
 import json
 from pathlib import Path
 from datetime import datetime
 import structlog
+import asyncio
+import random
+from enum import Enum
 
 from k8s_agent.audit import AuditLogger
 from k8s_agent.watcher import PodWatcher
@@ -19,18 +23,75 @@ logger = structlog.get_logger()
 
 app = FastAPI(title="K8s Remediation Dashboard", version="0.1.0")
 
+# Mount static files
+app.mount("/static", StaticFiles(directory="src/k8s_agent/dashboard/static"), name="static")
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint for the dashboard."""
-    return {"status": "healthy", "service": "k8s-remediation-dashboard"}
+# WebSocket connection manager
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Set[WebSocket] = set()
+        self.pending_approvals: Dict[str, dict] = {}
 
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.add(websocket)
+        logger.info("WebSocket client connected", count=len(self.active_connections))
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.discard(websocket)
+        logger.info("WebSocket client disconnected", count=len(self.active_connections))
+
+    async def broadcast(self, message: dict):
+        """Broadcast a message to all connected WebSocket clients."""
+        if self.active_connections:
+            # Convert message to JSON string
+            data = json.dumps(message)
+            # Send to all connected clients
+            for connection in self.active_connections:
+                try:
+                    await connection.send_text(data)
+                except Exception as e:
+                    logger.error("Failed to send WebSocket message", error=str(e))
+                    # Remove broken connection
+                    self.active_connections.discard(connection)
+
+manager = ConnectionManager()
 
 # Shared instances from main agent
 shared_policy_engine: Optional[PolicyEngine] = None
 shared_settings: Optional[Settings] = None
 shared_audit_logger: Optional[AuditLogger] = None
 
+@app.get("/")
+async def read_root():
+    """Serve the dashboard HTML page."""
+    try:
+        with open("src/k8s_agent/dashboard/static/index.html") as f:
+            content = f.read()
+        return HTMLResponse(content=content)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Dashboard not found")
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for the dashboard."""
+    return {"status": "healthy", "service": "k8s-remediation-dashboard"}
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time event updates."""
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection alive, wait for any messages from client (if needed)
+            data = await websocket.receive_text()
+            # Echo back or handle client messages if needed
+            await websocket.send_text(f"Message received: {data}")
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as e:
+        logger.error("WebSocket error", error=str(e))
+        manager.disconnect(websocket)
 
 def get_audit_logger() -> AuditLogger:
     if shared_audit_logger is not None:
@@ -40,7 +101,6 @@ def get_audit_logger() -> AuditLogger:
     settings = load_settings()
     return AuditLogger(settings)
 
-
 def get_policy_engine() -> PolicyEngine:
     if shared_policy_engine is not None:
         return shared_policy_engine
@@ -49,7 +109,6 @@ def get_policy_engine() -> PolicyEngine:
     settings = load_settings()
     return PolicyEngine(settings)
 
-
 def get_watcher() -> PodWatcher:
     # For current issues, we use a separate watcher instance in the dashboard
     # to avoid interfering with the main agent's watcher loop
@@ -57,13 +116,11 @@ def get_watcher() -> PodWatcher:
     settings = load_settings()
     return PodWatcher(settings)
 
-
 def get_diagnosis_engine() -> DiagnosisEngine:
     # For current issues, we use a separate diagnosis engine instance in the dashboard
     from k8s_agent.config import load_settings
     settings = load_settings()
     return DiagnosisEngine(settings)
-
 
 @app.get("/api/historical-actions", response_model=List[HistoricalAction])
 async def get_historical_actions(limit: int = 100):
@@ -89,97 +146,79 @@ async def get_historical_actions(limit: int = 100):
                             event_type=entry.get("event_type", ""),
                             pod_name=symptom_data.get("pod_name", ""),
                             namespace=symptom_data.get("namespace", ""),
-                            remediation_type=diagnosis_data.get("remediation_type", {}).value if isinstance(diagnosis_data.get("remediation_type"), dict) and hasattr(diagnosis_data.get("remediation_type"), 'value') else diagnosis_data.get("remediation_type"),
-                            outcome="success" if result_data.get("success", False) else "failed",
-                            details=entry.get("metadata", {})
+                            remediation_type=diagnosis_data.get("remediation_type", {}).value if isinstance(diagnosis_data.get(
+                                "remediation_type"), Enum) else str(diagnosis_data.get("remediation_type", "")),
+                            outcome=result_data.get("outcome", ""),
+                            details=entry
                         )
                         actions.append(action)
-                    except (json.JSONDecodeError, KeyError, AttributeError) as e:
-                        logger.warning("Failed to parse audit line", error=str(e), line=line[:100])
+                    except (json.JSONDecodeError, KeyError) as e:
+                        logger.warning("Failed to parse audit log entry", error=str(entry), exception=str(e))
                         continue
 
-        # Return most recent first
-        return list(reversed(actions))
+        return actions
     except Exception as e:
         logger.error("Failed to get historical actions", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to retrieve historical actions")
 
-
 @app.get("/api/current-issues", response_model=List[CurrentIssue])
 async def get_current_issues():
-    """Get current issues from the watcher/diagnosis engine."""
+    """Get current issues being monitored."""
     try:
         watcher = get_watcher()
         diagnosis_engine = get_diagnosis_engine()
-        policy_engine = get_policy_engine()
-
+        # In a real implementation, we would get current issues from the watcher
+        # For now, we can attempt to get real issues, but fall back to empty if there are connection issues
         issues = []
-
-        # Get current symptoms from watcher (non-blocking check)
-        # We'll get a limited number of symptoms to avoid blocking
-        symptoms_checked = 0
-        max_symptoms_to_check = 10
-
-        for symptom in watcher.watch_pods():
-            if symptoms_checked >= max_symptoms_to_check:
-                break
-
-            symptoms_checked += 1
-            try:
+        try:
+            # Get recent symptoms from watcher
+            for symptom in watcher.watch_pods():
+                # Diagnose the symptom
                 diagnosis = diagnosis_engine.diagnose(symptom)
                 if diagnosis:
-                    authorized, reason = policy_engine.authorize(diagnosis)
+                    # Convert to CurrentIssue model
                     issue = CurrentIssue(
-                        symptom={
-                            "pod_name": symptom.pod_name,
-                            "namespace": symptom.namespace,
-                            "failure_type": symptom.failure_type.value if hasattr(symptom.failure_type, 'value') else str(symptom.failure_type)
-                        },
-                        diagnosis={
-                            "root_cause": diagnosis.root_cause,
-                            "confidence": diagnosis.confidence,
-                            "remediation_type": diagnosis.remediation_type.value if hasattr(diagnosis.remediation_type, 'value') else str(diagnosis.remediation_type)
-                        },
-                        suggested_fix=f"Apply {diagnosis.remediation_type.value if hasattr(diagnosis.remediation_type, 'value') else str(diagnosis.remediation_type)} remediation",
+                        symptom=symptom.model_dump(),
+                        diagnosis=diagnosis.model_dump(),
+                        suggested_fix=diagnosis.remediation_type.value if hasattr(diagnosis.remediation_type, 'value') else str(diagnosis.remediation_type),
                         risk_level=diagnosis.risk_level.value if hasattr(diagnosis.risk_level, 'value') else str(diagnosis.risk_level),
                         requires_approval=diagnosis.requires_approval
                     )
                     issues.append(issue)
-            except Exception as e:
-                logger.warning("Failed to diagnose symptom", error=str(e), symptom=getattr(symptom, 'pod_name', 'unknown'))
-                continue
+                # Limit to prevent overload
+                if len(issues) >= 10:
+                    break
+        except Exception as e:
+            logger.warning("Could not get real current issues, using empty list", error=str(e))
+            issues = []
 
         return issues
     except Exception as e:
         logger.error("Failed to get current issues", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to retrieve current issues")
 
-
 @app.get("/api/pending-approvals", response_model=List[PendingAction])
 async def get_pending_approvals():
-    """Get actions pending human approval."""
+    """Get actions requiring human approval."""
     try:
         policy_engine = get_policy_engine()
-        pending_actions_data = policy_engine.get_pending_actions()
-
-        pending_actions = []
-        for action_data in pending_actions_data:
-            # Convert internal format to PendingAction model
-            action = PendingAction(
-                action_id=action_data["action_id"],
-                symptom=action_data["symptom"],
-                diagnosis=action_data["diagnosis"],
-                suggested_remediation=action_data["suggested_remediation"],
-                risk_level=action_data["risk_level"],
-                timestamp=action_data["timestamp"]
+        pending_actions = policy_engine.get_pending_actions()
+        # Convert to PendingAction models
+        result = []
+        for action_id, action_data in pending_actions.items():
+            pending_action = PendingAction(
+                action_id=action_id,
+                symptom=action_data.get("symptom", {}),
+                diagnosis=action_data.get("diagnosis", {}),
+                suggested_remediation=action_data.get("suggested_remediation", {}),
+                risk_level=action_data.get("risk_level", "unknown"),
+                timestamp=action_data.get("timestamp", "")
             )
-            pending_actions.append(action)
-
-        return pending_actions
+            result.append(pending_action)
+        return result
     except Exception as e:
         logger.error("Failed to get pending approvals", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to retrieve pending approvals")
-
 
 @app.post("/api/approve/{action_id}", response_model=ApproveRejectResponse)
 async def approve_action(action_id: str):
@@ -188,18 +227,34 @@ async def approve_action(action_id: str):
         policy_engine = get_policy_engine()
         success = policy_engine.approve_action(action_id)
         if success:
-            logger.info("Action approved via dashboard", action_id=action_id)
+            # Emit an event via WebSocket that the action was approved
+            event = {
+                "event_type": "fix_applied",  # More accurate event type
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "resource": {"namespace": "unknown", "kind": "Action", "name": action_id},
+                "severity": "low",
+                "payload": {
+                    "action_id": action_id,
+                    "approved_by": "operator",
+                    "approved_at": datetime.utcnow().isoformat() + "Z"
+                }
+            }
+            # Broadcast the approval event
+            await manager.broadcast(event)
             return ApproveRejectResponse(
                 success=True,
                 message="Action approved successfully",
                 action_id=action_id
             )
         else:
-            raise HTTPException(status_code=404, detail="Action not found or already processed")
+            return ApproveRejectResponse(
+                success=False,
+                message="Failed to approve action",
+                action_id=action_id
+            )
     except Exception as e:
-        logger.error("Failed to approve action", error=str(e), action_id=action_id)
+        logger.error("Failed to approve action", action_id=action_id, error=str(e))
         raise HTTPException(status_code=500, detail="Failed to approve action")
-
 
 @app.post("/api/reject/{action_id}", response_model=ApproveRejectResponse)
 async def reject_action(action_id: str):
@@ -208,295 +263,194 @@ async def reject_action(action_id: str):
         policy_engine = get_policy_engine()
         success = policy_engine.reject_action(action_id)
         if success:
-            logger.info("Action rejected via dashboard", action_id=action_id)
+            # Emit an event via WebSocket that the action was rejected
+            event = {
+                "event_type": "fix_rejected",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "resource": {"namespace": "unknown", "kind": "Action", "name": action_id},
+                "severity": "low",
+                "payload": {
+                    "action_id": action_id,
+                    "rejected_by": "operator",
+                    "rejected_at": datetime.utcnow().isoformat() + "Z"
+                }
+            }
+            # Broadcast the rejection event
+            await manager.broadcast(event)
             return ApproveRejectResponse(
                 success=True,
                 message="Action rejected successfully",
                 action_id=action_id
             )
         else:
-            raise HTTPException(status_code=404, detail="Action not found or already processed")
+            return ApproveRejectResponse(
+                success=False,
+                message="Failed to reject action",
+                action_id=action_id
+            )
     except Exception as e:
-        logger.error("Failed to reject action", error=str(e), action_id=action_id)
+        logger.error("Failed to reject action", action_id=action_id, error=str(e))
         raise HTTPException(status_code=500, detail="Failed to reject action")
 
+# Function to be called by the main agent to emit real events
+async def emit_event(event_type: str, resource: dict, severity: str, payload: dict):
+    """Emit a real event to all connected WebSocket clients."""
+    event = {
+        "event_type": event_type,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "resource": resource,
+        "severity": severity,
+        "payload": payload
+    }
+    await manager.broadcast(event)
+    logger.info("Broadcasted real event", event_type=event_type, resource=resource)
 
-@app.get("/", response_class=HTMLResponse)
-async def dashboard():
-    """Serve the main dashboard HTML."""
-    html_content = """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>K8s Remediation Dashboard</title>
-        <style>
-            body {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                margin: 0;
-                padding: 20px;
-                background-color: #f5f5f5;
-            }
-            .container {
-                max-width: 1200px;
-                margin: 0 auto;
-            }
-            h1 {
-                color: #333;
-                text-align: center;
-                margin-bottom: 30px;
-            }
-            .section {
-                background: white;
-                border-radius: 8px;
-                padding: 20px;
-                margin-bottom: 20px;
-                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            }
-            h2 {
-                color: #555;
-                margin-top: 0;
-            }
-            table {
-                width: 100%;
-                border-collapse: collapse;
-                margin-top: 10px;
-            }
-            th, td {
-                padding: 12px;
-                text-align: left;
-                border-bottom: 1px solid #ddd;
-            }
-            th {
-                background-color: #f8f9fa;
-                font-weight: 600;
-            }
-            tr:hover {
-                background-color: #f1f1f1;
-            }
-            .status-success { color: #28a745; font-weight: bold; }
-            .status-failed { color: #dc3545; font-weight: bold; }
-            .status-pending { color: #ffc107; font-weight: bold; }
-            .btn {
-                padding: 6px 12px;
-                margin: 2px;
-                border: none;
-                border-radius: 4px;
-                cursor: pointer;
-                font-size: 14px;
-            }
-            .btn-approve {
-                background-color: #28a745;
-                color: white;
-            }
-            .btn-reject {
-                background-color: #dc3545;
-                color: white;
-            }
-            .btn-disabled {
-                background-color: #6c757d;
-                color: white;
-                cursor: not-allowed;
-            }
-            .loading {
-                text-align: center;
-                padding: 20px;
-                color: #666;
-            }
-            .empty-state {
-                text-align: center;
-                padding: 40px;
-                color: #666;
-            }
-            .refresh-btn {
-                background-color: #007bff;
-                color: white;
-                padding: 8px 16px;
-                border: none;
-                border-radius: 4px;
-                cursor: pointer;
-                margin-bottom: 20px;
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Kubernetes Remediation Dashboard</h1>
+# Expose the emit function for use by the main agent
+app.state.emit_event = emit_event
 
-            <button class="refresh-btn" onclick="location.reload()">Refresh Data</button>
+# Startup event to begin generating mock events (commented out for real events)
+# @app.on_event("startup")
+# async def startup_event():
+#     """Start background tasks when the application starts."""
+#     logger.info("Starting K8s Remediation Dashboard")
+#     # Start the mock event generator in the background
+#     asyncio.create_task(generate_mock_events())
+#     logger.info("Mock event generator started")
 
-            <div class="section">
-                <h2>Historical Actions</h2>
-                <div id="historical-actions" class="loading">Loading...</div>
-            </div>
+# Shutdown event
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up when the application shuts down."""
+    logger.info("Shutting down K8s Remediation Dashboard")
 
-            <div class="section">
-                <h2>Current Issues</h2>
-                <div id="current-issues" class="loading">Loading...</div>
-            </div>
+# Background task to emit real cluster state and pending actions
+async def emit_cluster_state_and_pending_actions():
+    """Emit real cluster state and pending actions periodically."""
+    while True:
+        try:
+            # Emit cluster state
+            cluster_state = await get_cluster_state()
+            await manager.broadcast({
+                "event_type": "cluster_state_update",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "payload": cluster_state
+            })
 
-            <div class="section">
-                <h2>Pending Approvals</h2>
-                <div id="pending-approvals" class="loading">Loading...</div>
-            </div>
-        </div>
-
-        <script>
-            // Fetch and display historical actions
-            async function loadHistoricalActions() {
-                try {
-                    const response = await fetch('/api/historical-actions');
-                    const actions = await response.json();
-
-                    const container = document.getElementById('historical-actions');
-                    if (actions.length === 0) {
-                        container.innerHTML = '<div class="empty-state">No historical actions found</div>';
-                        return;
-                    }
-
-                    let html = '<table><thead><tr><th>Timestamp</th><th>Pod</th><th>Namespace</th><th>Action</th><th>Outcome</th></tr></thead><tbody>';
-                    actions.forEach(action => {
-                        const outcomeClass = action.outcome === 'success' ? 'status-success' : 'status-failed';
-                        html += `<tr>
-                            <td>${new Date(action.timestamp).toLocaleString()}</td>
-                            <td>${action.pod_name || 'N/A'}</td>
-                            <td>${action.namespace || 'N/A'}</td>
-                            <td>${action.remediation_type || action.event_type}</td>
-                            <td class="${outcomeClass}">${action.outcome}</td>
-                        </tr>`;
-                    });
-                    html += '</tbody></table>';
-                    container.innerHTML = html;
-                } catch (error) {
-                    document.getElementById('historical-actions').innerHTML =
-                        '<div class="empty-state">Error loading historical actions</div>';
-                    console.error('Error loading historical actions:', error);
+            # Emit pending actions
+            policy_engine = get_policy_engine()
+            pending_actions = policy_engine.get_pending_actions()
+            pending_actions_list = []
+            for action_id, action_data in pending_actions.items():
+                pending_actions_list.append({
+                    "action_id": action_id,
+                    "symptom": action_data.get("symptom", {}),
+                    "diagnosis": action_data.get("diagnosis", {}),
+                    "suggested_remediation": action_data.get("suggested_remediation", {}),
+                    "risk_level": action_data.get("risk_level", "unknown"),
+                    "timestamp": action_data.get("timestamp", "")
+                })
+            await manager.broadcast({
+                "event_type": "pending_actions_update",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "payload": {
+                    "pending_actions": pending_actions_list,
+                    "count": len(pending_actions_list)
                 }
-            }
+            })
 
-            // Fetch and display current issues
-            async function loadCurrentIssues() {
-                try {
-                    const response = await fetch('/api/current-issues');
-                    const issues = await response.json();
+            # Wait for 5 seconds before next update
+            await asyncio.sleep(5)
+        except Exception as e:
+            logger.error("Error in emit_cluster_state_and_pending_actions", error=str(e))
+            await asyncio.sleep(5)  # Wait before retrying
 
-                    const container = document.getElementById('current-issues');
-                    if (issues.length === 0) {
-                        container.innerHTML = '<div class="empty-state">No current issues found</div>';
-                        return;
-                    }
 
-                    let html = '<table><thead><tr><th>Pod</th><th>Namespace</th><th>Failure Type</th><th>Root Cause</th><th>Suggested Fix</th><th>Risk Level</th><th>Requires Approval</th></tr></thead><tbody>';
-                    issues.forEach(issue => {
-                        const riskClass = issue.risk_level.toLowerCase() === 'low' ? 'status-success' :
-                                        issue.risk_level.toLowerCase() === 'medium' ? 'status-pending' : 'status-failed';
-                        const approvalText = issue.requires_approval ? 'Yes' : 'No';
-                        html += `<tr>
-                            <td>${issue.symptom.pod_name || 'N/A'}</td>
-                            <td>${issue.symptom.namespace || 'N/A'}</td>
-                            <td>${issue.symptom.failure_type || 'N/A'}</td>
-                            <td>${issue.diagnosis.root_cause || 'N/A'}</td>
-                            <td>${issue.suggested_fix}</td>
-                            <td class="${riskClass}">${issue.risk_level}</td>
-                            <td>${approvalText}</td>
-                        </tr>`;
-                    });
-                    html += '</tbody></table>';
-                    container.innerHTML = html;
-                } catch (error) {
-                    document.getElementById('current-issues').innerHTML =
-                        '<div class="empty-state">Error loading current issues</div>';
-                    console.error('Error loading current issues:', error);
-                }
-            }
+async def get_cluster_state():
+    """Get the current state of the Kubernetes cluster."""
+    try:
+        from kubernetes import client, config as k8s_config
+        # Use shared settings or load settings
+        settings = get_settings()
+        if settings.kubeconfig_path:
+            k8s_config.load_kube_config(config_file=settings.kubeconfig_path)
+        else:
+            try:
+                k8s_config.load_incluster_config()
+            except Exception:
+                k8s_config.load_kube_config()
 
-            // Fetch and display pending approvals
-            async function loadPendingApprovals() {
-                try {
-                    const response = await fetch('/api/pending-approvals');
-                    const pending = await response.json();
+        v1 = client.CoreV1Api()
+        apps_v1 = client.AppsV1Api()
 
-                    const container = document.getElementById('pending-approvals');
-                    if (pending.length === 0) {
-                        container.innerHTML = '<div class="empty-state">No pending approvals</div>';
-                        return;
-                    }
+        # Get nodes
+        nodes = v1.list_node()
+        node_info = []
+        for node in nodes.items:
+            node_info.append({
+                "name": node.metadata.name,
+                "status": "Ready" if any(c.type == "Ready" and c.status == "True" for c in node.status.conditions) else "NotReady",
+                "roles": [label.split("/")[-1] for label in node.metadata.labels.keys() if label.startswith("node-role.kubernetes.io/")] or ["<none>"],
+                "age": node.metadata.creation_timestamp.isoformat() if node.metadata.creation_timestamp else ""
+            })
 
-                    let html = '<table><thead><tr><th>Action ID</th><th>Pod</th><th>Namespace</th><th>Suggested Remediation</th><th>Risk Level</th><th>Actions</th></tr></thead><tbody>';
-                    pending.forEach(action => {
-                        const riskClass = action.risk_level.toLowerCase() === 'low' ? 'status-success' :
-                                        action.risk_level.toLowerCase() === 'medium' ? 'status-pending' : 'status-failed';
-                        html += `<tr>
-                            <td>${action.action_id}</td>
-                            <td>${action.symptom.pod_name || 'N/A'}</td>
-                            <td>${action.symptom.namespace || 'N/A'}</td>
-                            <td>${JSON.stringify(action.suggested_remediation)}</td>
-                            <td class="${riskClass}">${action.risk_level}</td>
-                            <td>
-                                <button class="btn btn-approve" onclick="approveAction('${action.action_id}')">Approve</button>
-                                <button class="btn btn-reject" onclick="rejectAction('${action.action_id}')">Reject</button>
-                            </td>
-                        </tr>`;
-                    });
-                    html += '</tbody></table>';
-                    container.innerHTML = html;
-                } catch (error) {
-                    document.getElementById('pending-approvals').innerHTML =
-                        '<div class="empty-state">Error loading pending approvals</div>';
-                    console.error('Error loading pending approvals:', error);
-                }
-            }
+        # Get namespaces
+        namespaces = v1.list_namespace()
+        namespace_info = []
+        for ns in namespaces.items:
+            namespace_info.append({
+                "name": ns.metadata.name,
+                "status": ns.status.phase,
+                "age": ns.metadata.creation_timestamp.isoformat() if ns.metadata.creation_timestamp else ""
+            })
 
-            // Approve action
-            async function approveAction(actionId) {
-                try {
-                    const response = await fetch(`/api/approve/${actionId}`, { method: 'POST' });
-                    const result = await response.json();
-                    if (result.success) {
-                        alert('Action approved successfully');
-                        loadPendingApprovals(); // Refresh pending approvals
-                    } else {
-                        alert('Failed to approve action: ' + result.message);
-                    }
-                } catch (error) {
-                    alert('Error approving action');
-                    console.error('Error approving action:', error);
-                }
-            }
+        # Get pod summary across all namespaces (or just watched namespaces)
+        # We'll get pods in all namespaces for simplicity, but could filter by settings.watcher.namespaces
+        pods = v1.list_pod_for_all_namespaces(watch=False)
+        pod_summary = {
+            "total": len(pods.items),
+            "running": len([p for p in pods.items if p.status.phase == "Running"]),
+            "pending": len([p for p in pods.items if p.status.phase == "Pending"]),
+            "failed": len([p for p in pods.items if p.status.phase == "Failed"]),
+            "succeeded": len([p for p in pods.items if p.status.phase == "Succeeded"]),
+            "unknown": len([p for p in pods.items if p.status.phase == "Unknown"])
+        }
 
-            // Reject action
-            async function rejectAction(actionId) {
-                try {
-                    const response = await fetch(`/api/reject/${actionId}`, { method: 'POST' });
-                    const result = await response.json();
-                    if (result.success) {
-                        alert('Action rejected successfully');
-                        loadPendingApprovals(); // Refresh pending approvals
-                    } else {
-                        alert('Failed to reject action: ' + result.message);
-                    }
-                } catch (error) {
-                    alert('Error rejecting action');
-                    console.error('Error rejecting action:', error);
-                }
-            }
+        # Get deployment summary
+        deployments = apps_v1.list_deployment_for_all_namespaces(watch=False)
+        deployment_summary = {
+            "total": len(deployments.items),
+            "available": len([d for d in deployments.items if d.status.available_replicas is not None and d.status.available_replicas > 0])
+        }
 
-            // Load data on page load
-            document.addEventListener('DOMContentLoaded', () => {
-                loadHistoricalActions();
-                loadCurrentIssues();
-                loadPendingApprovals();
+        return {
+            "nodes": node_info,
+            "namespaces": namespace_info,
+            "pod_summary": pod_summary,
+            "deployment_summary": deployment_summary,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    except Exception as e:
+        logger.error("Failed to get cluster state", error=str(e))
+        return {
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
 
-                // Refresh every 30 seconds
-                setInterval(() => {
-                    loadHistoricalActions();
-                    loadCurrentIssues();
-                    loadPendingApprovals();
-                }, 30000);
-            });
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
+
+def get_settings():
+    """Get settings shared with the agent or load if not available."""
+    if shared_settings is not None:
+        return shared_settings
+    # Fallback to creating a new one (should not happen in normal operation)
+    from k8s_agent.config import load_settings
+    return load_settings()
+
+
+# Startup event to begin generating real events
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks when the application starts."""
+    logger.info("Starting K8s Remediation Dashboard")
+    # Start the background task for emitting cluster state and pending actions
+    asyncio.create_task(emit_cluster_state_and_pending_actions())
+    logger.info("Cluster state and pending actions emitter started")
