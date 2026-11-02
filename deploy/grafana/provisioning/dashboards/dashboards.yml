@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: remediation-agent
+    orgId: 1
+    folder: Kubernetes Remediation
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

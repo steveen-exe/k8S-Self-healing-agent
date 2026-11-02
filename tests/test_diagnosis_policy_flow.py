@@ -39,6 +39,11 @@ def mock_settings():
     settings.watcher = Mock(spec=WatcherConfig)
     settings.watcher.namespaces = ["default"]
 
+    # Add API key attributes for LLM client
+    settings.omniroute_api_key = None
+    settings.omniroute_base_url = None
+    settings.anthropic_api_key = "test-api-key"
+
     return settings
 
 
@@ -387,41 +392,41 @@ class TestPolicyEngine:
 class TestExecutor:
     """Test remediation executor."""
 
-    @patch('kubernetes.client.CoreV1Api')
-    @patch('kubernetes.client.AppsV1Api')
-    def test_restart_pod_dry_run(self, mock_apps_v1, mock_v1, mock_settings, sample_diagnosis):
-        """Test dry-run pod restart."""
-        executor = Executor(mock_settings)
-
-        result = executor.execute(sample_diagnosis, dry_run=True)
+    def test_restart_pod_dry_run(self, mock_settings, sample_diagnosis):
+        """Test dry-run pod restart - dry run should not call Kubernetes API."""
+        with patch('k8s_agent.executor.client.CoreV1Api'), \
+             patch('k8s_agent.executor.client.AppsV1Api'):
+            executor = Executor(mock_settings)
+            result = executor.execute(sample_diagnosis, dry_run=True)
 
         assert result.dry_run is True
         assert result.success is True
         assert "[DRY RUN]" in result.output
 
-    @patch('kubernetes.client.CoreV1Api')
-    @patch('kubernetes.client.AppsV1Api')
-    def test_no_action_type(self, mock_apps_v1, mock_v1, mock_settings, sample_diagnosis):
+    def test_no_action_type(self, mock_settings, sample_diagnosis):
         """Test no-action remediation type."""
         sample_diagnosis.remediation_type = RemediationType.NO_ACTION
-        executor = Executor(mock_settings)
-
-        result = executor.execute(sample_diagnosis, dry_run=True)
+        with patch('k8s_agent.executor.client.CoreV1Api'), \
+             patch('k8s_agent.executor.client.AppsV1Api'):
+            executor = Executor(mock_settings)
+            result = executor.execute(sample_diagnosis, dry_run=True)
 
         assert result.success is True
         assert "manual intervention" in result.output.lower()
 
-    @patch('kubernetes.client.CoreV1Api')
-    @patch('kubernetes.client.AppsV1Api')
-    def test_executor_error_handling(self, mock_apps_v1, mock_v1, mock_settings, sample_diagnosis):
-        """Test executor error handling."""
-        mock_v1.return_value.delete_namespaced_pod.side_effect = Exception("API error")
-        executor = Executor(mock_settings)
-
-        result = executor.execute(sample_diagnosis, dry_run=False)
+    def test_executor_error_handling(self, mock_settings, sample_diagnosis):
+        """Test executor error handling with mocked API call failure."""
+        # Change to RESTART_POD so the mock exception will be triggered
+        sample_diagnosis.remediation_type = RemediationType.RESTART_POD
+        with patch('k8s_agent.executor.client.CoreV1Api') as mock_v1, \
+             patch('k8s_agent.executor.client.AppsV1Api'):
+            mock_v1.return_value.delete_namespaced_pod.side_effect = Exception("API error")
+            executor = Executor(mock_settings)
+            result = executor.execute(sample_diagnosis, dry_run=False)
 
         assert result.success is False
         assert result.error is not None
+        assert "API error" in result.error
 
 
 # Integration Tests

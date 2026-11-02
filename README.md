@@ -1,103 +1,135 @@
 # Kubernetes Remediation Agent with Dashboard
 
-A Kubernetes remediation agent that automatically detects and fixes common cluster issues, now with a web dashboard for monitoring and human oversight.
+A guardrailed Kubernetes self-healing agent that automatically detects, diagnoses, and remediates cluster failure conditions, paired with an embedded FastAPI web dashboard for real-time monitoring and human oversight.
+
+## Core Safety Contract
+
+> **Diagnosis** proposes an action → **Policy Engine** evaluates authorization → **Human Approval** (if required) marks action executable → **Executor** executes action → **Audit Log & Dashboard** record actual result.
 
 ## Features
 
-- **Automatic Detection**: Watches for failing pods in specified namespaces
-- **Intelligent Diagnosis**: Uses LLM-assisted analysis to identify root causes
-- **Policy-Based Authorization**: Configurable remediation policies with approval workflows
-- **Execution Engine**: Safely executes remediation actions (with dry-run support)
-- **Audit Logging**: Comprehensive logging for compliance and debugging
-- **Web Dashboard**: Real-time monitoring and human approval interface
+- **Automatic Detection**: Watches Kubernetes pods in specified namespaces for CrashLoopBackOff, ImagePullBackOff, and OOMKilled errors.
+- **Deduplication & Cooldown**: Intelligent symptom deduplication prevents alert storms and duplicate pending approvals.
+- **Intelligent Diagnosis**: Fast rule-based diagnosis with LLM fallback capabilities.
+- **Policy-Based Control**: Thread-safe policy engine supporting risk scoring, rate limiting, and explicit approval states (`pending`, `approved`, `claimed`, `rejected`, `completed`, `failed`).
+- **Execution Engine**: Executes approved actions with safe defaults (`dry_run_only: true` by default).
+- **Audit Logging**: Structured JSONL audit logging of all diagnoses, policy decisions, approvals, and execution results.
+- **Durable Action State**: SQLite-backed approval and execution state survives agent restarts and prevents duplicate claims.
+- **Prometheus Metrics**: `/metrics` exposes remediation counters and outcomes for Grafana dashboards.
+- **Real-Time Dashboard**: Embedded FastAPI dashboard with WebSocket broadcasting, polling, and interactive approval controls.
 
-## Dashboard
+## Installation & Setup
 
-The agent now includes an embedded web dashboard that provides:
-
-- **Historical Actions**: View past remediation attempts from the audit log
-- **Current Issues**: See currently failing pods being monitored
-- **Pending Approvals**: Review and approve/reject actions requiring human oversight
-- **Real-time Updates**: Frontend polls APIs every 30 seconds for fresh data
-
-Access the dashboard at `http://localhost:8000` when the agent is running.
-
-## Architecture
-
-```
-Main Agent Loop
-    │
-    ├── Watcher → Detects failing pods
-    ├── DiagnosisEngine → Analyzes symptoms and suggests remediations
-    ├── PolicyEngine → Checks authorization (with pending actions tracking)
-    ├── Executor → Performs remediation actions
-    └── AuditLogger → Logs all activities for compliance
-        
-Dashboard (FastAPI Server)
-    │
-    ├── GET /api/historical-actions → Reads from audit log
-    ├── GET /api/current-issues → Gets current failing pods
-    ├── GET /api/pending-approvals → Returns actions needing approval
-    ├── POST /api/approve/{id} → Approves pending action
-    ├── POST /api/reject/{id} → Rejects pending action
-    └── GET / → Serves HTML/JS frontend
-```
-
-## Installation
+Set up a virtual environment and install all dependencies in editable mode:
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Create and activate virtual environment
+python3 -m venv venv
+source venv/bin/activate
 
-# Or install individually:
-pip install fastapi uvicorn python-multipart kubernetes anthropic pyyaml structlog python-json-logger pydantic
+# Install project with dev dependencies
+pip install --upgrade pip setuptools wheel
+pip install -e ".[dev]"
 ```
 
-## Configuration
+## Running the Agent
 
-Create `config/agent.yaml` based on the example structure. The agent will look for this file on startup.
-
-**Note**: When using OmniRoute, the `llm.model` value must include a provider prefix (e.g., "anthropic/claude-sonnet-5-20241022"). Refer to the OmniRoute documentation for the correct format.
-
-## Usage
+Start the agent (the embedded dashboard starts automatically on port 8000):
 
 ```bash
-# Run the agent (dashboard starts automatically)
-python3 src/agent.py
+# Activate venv
+source venv/bin/activate
 
-# Access dashboard at http://localhost:8000
+# Run agent with PYTHONPATH
+PYTHONPATH=src python3 src/agent.py
 ```
 
-## API Endpoints
+Access the dashboard at `http://localhost:8000`.
 
-- `GET /` - Dashboard HTML interface
-- `GET /health` - Health check
-- `GET /api/historical-actions` - List past remediation actions
-- `GET /api/current-issues` - Show currently monitored failing pods
-- `GET /api/pending-approvals` - List actions requiring human approval
-- `POST /api/approve/{action_id}` - Approve a pending action
-- `POST /api/reject/{action_id}` - Reject a pending action
+## Running Tests
 
-## Testing
+Run the complete test suite:
 
-Run the validation script:
 ```bash
-python3 test_dashboard.py
+# Activate venv
+source venv/bin/activate
+
+# Run test runner
+bash test.sh
 ```
 
-## Memory & Persistence
+Or run pytest directly:
 
-Important facts and decisions can be preserved across system sessions using the Claude memory system. To store information for future reference:
-
-Simply ask: "Remember that [specific fact you want to preserve]"
-
-Examples:
-- "Remember that I prefer using Sonnet 4 for coding tasks"
-- "Remember that my Kubernetes cluster is in the 'staging' namespace"
-- "Remember that I want all remediations to run in dry-run mode by default"
-
-These memories are stored as files in:
+```bash
+PYTHONPATH=src pytest -xvs tests/test_diagnosis_policy_flow.py test_dashboard.py
 ```
+
+## Dashboard API Endpoints
+
+- `GET /` - Serves interactive HTML dashboard
+- `GET /health` - Health check status
+- `GET /metrics` - Prometheus metrics for Grafana scraping
+- `GET /api/v1/incidents` - Versioned incident view for Grafana
+- `GET /api/v1/actions` - Versioned pending-action view for Grafana
+- `POST /api/v1/alerts/grafana` - Authenticated Grafana alert ingestion
+- `POST /api/v1/actions/{action_id}/approve` - Authenticated operator approval
+- `POST /api/v1/actions/{action_id}/reject` - Authenticated operator rejection
+- `GET /ws` - WebSocket endpoint for real-time event updates
+- `GET /api/pending-approvals` - List actions requiring operator approval
+- `GET /api/current-issues` - Show cached active symptoms (maintained by agent)
+- `GET /api/historical-actions` - Retrieve past audit log entries
+- `POST /api/approve/{action_id}` - Approve pending action (emits `approval_granted`)
+- `POST /api/reject/{action_id}` - Reject pending action (emits `approval_rejected`)
+
+## Approval Lifecycle
+
+1. **Detection**: Watcher detects failing pod → creates `Symptom`.
+2. **Diagnosis**: Engine generates `Diagnosis` with remediation parameters and risk level.
+3. **Policy Evaluation**: If action requires approval, policy stores pending action with `action_id`.
+4. **Dashboard Approval**: Operator clicks Approve in dashboard → API updates state to `approved` and emits `approval_granted`.
+5. **Execution Claim**: Main agent loop claims approved action exactly once via atomic `claim_approved_action()`.
+6. **Execution**: Executor runs remediation against Kubernetes cluster.
+7. **Result Broadcast**: Emits `fix_applied` on success or `fix_failed` on error, and appends to audit log.
+
+## Environment Variables & Configuration
+
+Configuration is loaded from `config/agent.yaml` or environment variables:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ANTHROPIC_API_KEY` | Key for Anthropic LLM diagnosis fallback | Optional |
+| `OMNIROUTE_API_KEY` | Key for OmniRoute multi-model API | Optional |
+| `OMNIROUTE_BASE_URL` | OmniRoute endpoint URL | Optional |
+| `KUBECONFIG` / `kubeconfig_path` | Path to kubeconfig file | In-cluster config |
+
+The default action workflow is persisted at `logs/actions.sqlite3`. Keep
+`policy.dry_run_only: true` until live remediation has been validated in a
+dedicated namespace.
+
+The versioned operator API requires `REMEDIATION_API_TOKEN`, and the Grafana
+webhook requires `GRAFANA_WEBHOOK_SECRET`. Configure both through a secret
+manager or deployment environment; do not commit their values.
+
+## Grafana and Prometheus
+
+The repository includes a Docker Compose integration in
+[`deploy/grafana/`](deploy/grafana/). Start the agent first so Prometheus can
+scrape `http://localhost:8000/metrics`, then start Grafana and Prometheus:
+
+```bash
+source venv/bin/activate
+PYTHONPATH=src python3 src/agent.py
+
+cd deploy/grafana
+GRAFANA_ADMIN_PASSWORD='use-a-new-local-password' docker compose up -d
+```
+
+Open Grafana at `http://localhost:3000`. The `Kubernetes Remediation Agent`
+dashboard and Prometheus datasource are provisioned automatically.
+
+This integration provides observability only. Approval actions still go
+through the authenticated agent API; Grafana does not receive Kubernetes
+credentials and does not execute cluster mutations directly.
 /home/user/.claude-omniroute/projects/-home-user-my-ai-agent/memory/
 ```
 

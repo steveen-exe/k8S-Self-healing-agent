@@ -1,7 +1,7 @@
 """Configuration management."""
 
 from pathlib import Path
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from pydantic_settings import BaseSettings
 import yaml
 
@@ -47,10 +47,16 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
     audit_log_path: Path = Path("logs/audit.jsonl")
+    action_store_path: Path = Path("logs/actions.sqlite3")
+    api_token: str | None = Field(default=None, alias="REMEDIATION_API_TOKEN")
+    grafana_webhook_secret: str | None = Field(
+        default=None, alias="GRAFANA_WEBHOOK_SECRET"
+    )
 
-    class Config:
-        env_file = ".env"
-        env_nested_delimiter = "__"
+    model_config = ConfigDict(
+        env_file=".env",
+        env_nested_delimiter="__"
+    )
 
 
 def load_settings(config_path: Path | None = None) -> Settings:

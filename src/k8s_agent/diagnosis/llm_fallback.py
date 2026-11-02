@@ -58,6 +58,17 @@ class LLMDiagnoser:
                 logger.error("LLM returned empty content")
                 return None
 
+            # Strip markdown code fences if present (e.g. ```json ... ```)
+            stripped = content.strip()
+            if stripped.startswith("```"):
+                lines = stripped.splitlines()
+                # Remove first line (```json or ```) and last line (```)
+                inner_lines = lines[1:] if len(lines) > 1 else lines
+                if inner_lines and inner_lines[-1].strip() == "```":
+                    inner_lines = inner_lines[:-1]
+                stripped = "\n".join(inner_lines)
+            content = stripped
+
             # Parse the JSON content
             try:
                 result_data = json.loads(content)

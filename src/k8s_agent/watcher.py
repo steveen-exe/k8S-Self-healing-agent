@@ -3,6 +3,7 @@
 """Kubernetes cluster state watcher."""
 
 import structlog
+from datetime import datetime, timedelta
 try:
     from kubernetes import client, config as k8s_config, watch
 except ImportError:  # pragma: no cover
@@ -20,8 +21,12 @@ logger = structlog.get_logger()
 class PodWatcher:
     """Watches Kubernetes pods for failure symptoms."""
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, symptom_cooldown_seconds: int = 300):
         self.settings = settings
+        self.symptom_cooldown_seconds = symptom_cooldown_seconds
+        # Track last diagnosis time per pod/container/failure_type
+        # Key: (namespace, pod_name, container_name, failure_type)
+        self._last_symptom_time: dict[tuple, datetime] = {}
         self._setup_k8s_client()
 
     def _setup_k8s_client(self) -> None:
@@ -42,7 +47,10 @@ class PodWatcher:
         self.v1 = client.CoreV1Api()
 
     def watch_pods(self) -> Iterator[Symptom]:
-        """Watch pods and yield symptoms when failures detected."""
+        """Watch pods and yield symptoms when failures detected.
+
+        Deduplicates symptoms based on pod/container/failure_type with cooldown period.
+        """
         logger.info("Starting pod watcher", namespaces=self.settings.watcher.namespaces)
 
         for namespace in self.settings.watcher.namespaces:
@@ -52,10 +60,41 @@ class PodWatcher:
                 for pod in pods.items:
                     symptom = self._check_pod_health(pod, namespace)
                     if symptom:
-                        yield symptom
+                        # Check if we've recently diagnosed this symptom
+                        if self._should_diagnose_symptom(symptom):
+                            yield symptom
+                            self._mark_symptom_diagnosed(symptom)
+                        else:
+                            logger.debug(
+                                "Symptom in cooldown period, skipping",
+                                pod=symptom.pod_name,
+                                container=symptom.container_name,
+                                failure_type=symptom.failure_type.value,
+                            )
 
             except Exception as e:
                 logger.error("Error watching namespace", namespace=namespace, error=str(e))
+
+    def _should_diagnose_symptom(self, symptom: Symptom) -> bool:
+        """Check if enough time has passed since last diagnosis of this symptom."""
+        key = (symptom.namespace, symptom.pod_name, symptom.container_name, symptom.failure_type.value)
+
+        last_time = self._last_symptom_time.get(key)
+        if last_time is None:
+            # Never diagnosed before
+            return True
+
+        elapsed = (datetime.utcnow() - last_time).total_seconds()
+        if elapsed >= self.symptom_cooldown_seconds:
+            # Cooldown period expired, allow new diagnosis
+            return True
+
+        return False
+
+    def _mark_symptom_diagnosed(self, symptom: Symptom) -> None:
+        """Record that we've diagnosed this symptom at current time."""
+        key = (symptom.namespace, symptom.pod_name, symptom.container_name, symptom.failure_type.value)
+        self._last_symptom_time[key] = datetime.utcnow()
 
     def _check_pod_health(self, pod: client.V1Pod, namespace: str) -> Symptom | None:
         """Check if pod has failure symptoms worth diagnosing."""

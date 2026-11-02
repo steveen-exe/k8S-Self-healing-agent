@@ -14,6 +14,12 @@
 </head>
 <body class="bg-gray-50">
     <div id="root"></div>
+    <script>
+        window.onerror = function(msg, url, lineNo, columnNo, error) {
+            console.error('Global error:', msg, 'at', lineNo + ':' + columnNo, error);
+            document.body.innerHTML = '<div style="color: red; padding: 20px; font-family: monospace;"><h1>Error Loading Dashboard</h1><pre>' + error + '</pre></div>';
+        };
+    </script>
     <script type="text/babel" src="/static/js/app.js"></script>
 </body>
 </html>

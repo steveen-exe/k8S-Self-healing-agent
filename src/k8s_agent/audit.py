@@ -16,7 +16,7 @@ class AuditLogger:
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.audit_log_path = settings.audit_log_path
+        self.audit_log_path = Path(settings.audit_log_path)
 
     def log_diagnosis(self, diagnosis: Diagnosis) -> None:
         """Log a completed diagnosis."""

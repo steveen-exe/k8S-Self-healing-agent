@@ -27,14 +27,19 @@ watcher:
   # Namespaces to monitor (use ["*"] for all namespaces)
   namespaces:
     - default
-    - production
+    - test-remediation
 
   # How often to check for failures (seconds)
-  watch_interval_seconds: 30
+  watch_interval_seconds: 10
 
   # Minimum restart count before considering remediation
-  min_restart_count_threshold: 3
+  min_restart_count_threshold: 1
 
 # Logging
 log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
 audit_log_path: "logs/audit.jsonl"
+action_store_path: "logs/actions.sqlite3"
+
+# Set through environment/secret management in deployments, not in source control.
+# api_token: null
+# grafana_webhook_secret: null

@@ -3,15 +3,18 @@
 
 import time
 import structlog
+import threading
 import uuid
 from collections import deque
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import statistics
 
 from .types import Diagnosis, RiskLevel, RemediationResult
 from enum import Enum
 from .config import Settings
+from .action_store import ActionStore
 
 logger = structlog.get_logger()
 
@@ -30,6 +33,9 @@ class PolicyEngine:
         self._approved_actions: Dict[str, dict] = {}
         # Track rejected actions
         self._rejected_actions: Dict[str, dict] = {}
+        self._lock = threading.Lock()
+        configured_store_path = getattr(settings, "action_store_path", Path("logs/actions.sqlite3"))
+        self._action_store = ActionStore(configured_store_path)
 
         # Risk assessment weights
         self.risk_weights = {
@@ -41,7 +47,8 @@ class PolicyEngine:
         }
 
         # Confidence threshold for diagnosis acceptance
-        self.min_confidence_threshold = settings.policy.get("min_confidence_threshold", 0.7)
+        # Default to 0.7 if not explicitly set in PolicyConfig
+        self.min_confidence_threshold = 0.7
 
     def authorize(self, diagnosis: Diagnosis) -> tuple[bool, str]:
         """
@@ -79,6 +86,7 @@ class PolicyEngine:
                     "timestamp": datetime.utcnow().isoformat()
                 }
                 self._pending_actions[action_id] = pending_action
+                self._action_store.create(action_id, pending_action)
                 logger.info(
                     "Action added to pending approvals",
                     action_id=action_id,
@@ -106,6 +114,7 @@ class PolicyEngine:
                     "timestamp": datetime.utcnow().isoformat()
                 }
                 self._pending_actions[action_id] = pending_action
+                self._action_store.create(action_id, pending_action)
                 logger.info(
                     "Action added to pending approvals",
                     action_id=action_id,
@@ -330,26 +339,75 @@ class PolicyEngine:
 
     def get_pending_actions(self) -> Dict[str, dict]:
         """Get dict of pending actions requiring approval."""
-        return self._pending_actions
+        with self._lock:
+            persisted = self._action_store.list_by_status("pending")
+            self._pending_actions.update(persisted)
+            return dict(self._pending_actions)
 
     def approve_action(self, action_id: str) -> bool:
         """Approve a pending action."""
-        if action_id in self._pending_actions:
-            action_data = self._pending_actions.pop(action_id)
-            self._approved_actions[action_id] = action_data
-            self._record_action()
-            logger.info("Action approved", action_id=action_id)
-            return True
-        return False
+        with self._lock:
+            if action_id in self._pending_actions:
+                action_data = self._pending_actions.pop(action_id)
+                self._approved_actions[action_id] = action_data
+                self._action_store.transition(
+                    action_id, "pending", "approved", actor="operator"
+                )
+                self._record_action()
+                logger.info("Action approved", action_id=action_id)
+                return True
+            return False
 
     def reject_action(self, action_id: str) -> bool:
         """Reject a pending action."""
-        if action_id in self._pending_actions:
-            action_data = self._pending_actions.pop(action_id)
-            self._rejected_actions[action_id] = action_data
-            logger.info("Action rejected", action_id=action_id)
-            return True
-        return False
+        with self._lock:
+            if action_id in self._pending_actions:
+                action_data = self._pending_actions.pop(action_id)
+                self._rejected_actions[action_id] = action_data
+                self._action_store.transition(
+                    action_id, "pending", "rejected", actor="operator"
+                )
+                logger.info("Action rejected", action_id=action_id)
+                return True
+            return False
+
+    def claim_approved_action(self, action_id: str) -> Optional[dict]:
+        """Atomically claim an approved action for execution. Returns payload or None."""
+        with self._lock:
+            action_data = self._approved_actions.get(action_id)
+            if action_data is None:
+                action_data = self._action_store.list_by_status("approved").get(action_id)
+            if action_data is None:
+                return None
+            claimed = self._action_store.transition(
+                action_id, "approved", "claimed", actor="agent"
+            )
+            if claimed is None:
+                return None
+            self._approved_actions.pop(action_id, None)
+            return claimed
+
+    def get_approved_action_ids(self) -> list:
+        """Return list of action IDs currently approved and awaiting execution."""
+        with self._lock:
+            persisted = self._action_store.list_by_status("approved")
+            self._approved_actions.update(persisted)
+            return list(self._approved_actions.keys())
+
+    def complete_action(self, action_id: str, success: bool, error: str | None = None) -> bool:
+        """Persist the terminal result of a claimed action."""
+        terminal_status = "succeeded" if success else "failed"
+        with self._lock:
+            return (
+                self._action_store.transition(
+                    action_id,
+                    "claimed",
+                    terminal_status,
+                    actor="agent",
+                    error=error,
+                )
+                is not None
+            )
 
     def get_risk_assessment_stats(self) -> dict:
         """Get statistics about risk assessments for monitoring."""

@@ -92,6 +92,9 @@ class Executor:
         symptom = diagnosis.symptom
         factor = diagnosis.remediation_params.get("memory_increase_factor", 1.5)
 
+        if dry_run:
+            return f"[DRY RUN] Would increase memory by {factor}x for container {symptom.container_name} in pod {symptom.pod_name}"
+
         # Find the deployment controlling this pod
         pod = self.v1.read_namespaced_pod(
             name=symptom.pod_name,
@@ -146,12 +149,6 @@ class Executor:
         # Parse memory value (e.g., "512Mi", "1Gi")
         new_memory = self._scale_memory(current_memory, factor)
 
-        if dry_run:
-            return (
-                f"[DRY RUN] Would update deployment {deployment_name} "
-                f"container {symptom.container_name} memory limit: {current_memory} -> {new_memory}"
-            )
-
         # Update deployment
         target_container.resources.limits["memory"] = new_memory
         if target_container.resources.requests and "memory" in target_container.resources.requests:
@@ -172,6 +169,9 @@ class Executor:
         """Rollback deployment to previous revision."""
         symptom = diagnosis.symptom
 
+        if dry_run:
+            return f"[DRY RUN] Would rollback deployment to previous revision for pod {symptom.pod_name}"
+
         # Find deployment (similar logic as increase_memory)
         pod = self.v1.read_namespaced_pod(
             name=symptom.pod_name,
@@ -181,9 +181,6 @@ class Executor:
         deployment_name = self._find_deployment_name(pod, symptom.namespace)
         if not deployment_name:
             return "Cannot rollback: deployment not found"
-
-        if dry_run:
-            return f"[DRY RUN] Would rollback deployment {deployment_name} to previous revision"
 
         # Trigger rollback via kubectl (simpler than manual revision management)
         # In production, you'd use client-go's proper rollback mechanism

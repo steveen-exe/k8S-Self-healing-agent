@@ -15,6 +15,7 @@ from k8s_agent.diagnosis.engine import DiagnosisEngine
 from k8s_agent.policy import PolicyEngine
 from k8s_agent.executor import Executor
 from k8s_agent.audit import AuditLogger
+from k8s_agent.metrics import metrics
 
 # Import dashboard components to set shared instances
 from k8s_agent.dashboard.api import shared_policy_engine, shared_settings, shared_audit_logger
@@ -62,10 +63,10 @@ def main() -> None:
     audit_logger = AuditLogger(settings)
 
     # Set shared instances for dashboard
-    from k8s_agent.dashboard.api import shared_policy_engine, shared_settings, shared_audit_logger
-    shared_policy_engine = policy_engine
-    shared_settings = settings
-    shared_audit_logger = audit_logger
+    import k8s_agent.dashboard.api as _dashboard_api
+    _dashboard_api.shared_policy_engine = policy_engine
+    _dashboard_api.shared_settings = settings
+    _dashboard_api.shared_audit_logger = audit_logger
 
     # Start dashboard server in a background thread
     dashboard_thread = threading.Thread(
@@ -87,6 +88,7 @@ def main() -> None:
 
             # Watch for symptoms
             for symptom in watcher.watch_pods():
+                metrics.increment("symptoms_detected_total")
                 logger.info(
                     "Detected failing pod",
                     pod=symptom.pod_name,
@@ -97,8 +99,37 @@ def main() -> None:
                 # Diagnose
                 diagnosis = diagnosis_engine.diagnose(symptom)
                 if not diagnosis:
+                    metrics.increment("diagnosis_failed_total")
                     logger.warning("Could not diagnose symptom", pod=symptom.pod_name)
                     continue
+                metrics.increment("diagnoses_completed_total")
+
+                # Add to issue cache for the dashboard
+                try:
+                    import asyncio
+                    from k8s_agent.dashboard.api import issue_cache
+
+                    issue_dict = {
+                        "symptom": symptom.model_dump(),
+                        "diagnosis": diagnosis.model_dump(),
+                        "suggested_fix": diagnosis.remediation_type.value if hasattr(diagnosis.remediation_type, 'value') else str(diagnosis.remediation_type),
+                        "risk_level": diagnosis.risk_level.value if hasattr(diagnosis.risk_level, 'value') else str(diagnosis.risk_level),
+                        "requires_approval": diagnosis.requires_approval
+                    }
+
+                    # Store in async cache using event loop or run_until_complete
+                    try:
+                        loop = asyncio.get_event_loop()
+                    except RuntimeError:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+
+                    if loop.is_running():
+                        asyncio.run_coroutine_threadsafe(issue_cache.add_issue(issue_dict), loop)
+                    else:
+                        loop.run_until_complete(issue_cache.add_issue(issue_dict))
+                except Exception as e:
+                    logger.warning("Failed to add issue to cache", error=str(e))
 
                 audit_logger.log_diagnosis(diagnosis)
 
@@ -113,6 +144,7 @@ def main() -> None:
                 # Check authorization using policy decision
                 policy_decision = policy_engine.get_policy_decision(diagnosis)
                 if policy_decision["decision"] != "ALLOW_AUTO":
+                    metrics.increment("actions_denied_total")
                     logger.info(
                         "Remediation not authorized",
                         pod=symptom.pod_name,
@@ -123,6 +155,7 @@ def main() -> None:
 
                     # If the decision is REQUIRE_APPROVAL, emit an approval requested event
                     if policy_decision["decision"] == "REQUIRE_APPROVAL":
+                        metrics.increment("actions_pending_approval")
                         action_id = policy_decision.get("action_id")
                         if action_id:
                             import asyncio
@@ -233,6 +266,9 @@ def main() -> None:
 
                 # Execute remediation
                 result = executor.execute(diagnosis)
+                metrics.increment(
+                    "actions_succeeded_total" if result.success else "actions_failed_total"
+                )
                 audit_logger.log_remediation(result)
 
                 if result.success:
@@ -339,6 +375,152 @@ def main() -> None:
                     action_id=f"action-{int(time.time())}",
                     success=result.success
                 )
+
+            # Process any approved actions awaiting execution
+            approved_ids = policy_engine.get_approved_action_ids()
+            for action_id in approved_ids:
+                action_data = policy_engine.claim_approved_action(action_id)
+                if action_data is None:
+                    continue  # Action was already claimed by another thread
+
+                # Reconstruct Diagnosis from stored action_data
+                try:
+                    diagnosis_dict = action_data.get("diagnosis", {})
+                    # Recreate the Diagnosis object from the stored dict
+                    from k8s_agent.types import Diagnosis as DiagnosisType
+                    diagnosis = DiagnosisType.model_validate(diagnosis_dict)
+
+                    logger.info(
+                        "Executing approved remediation",
+                        action_id=action_id,
+                        pod=diagnosis.symptom.pod_name,
+                        remediation=diagnosis.remediation_type.value,
+                    )
+
+                    # Execute the remediation
+                    result = executor.execute(diagnosis)
+                    metrics.increment(
+                        "actions_succeeded_total" if result.success else "actions_failed_total"
+                    )
+                    audit_logger.log_remediation(result, approved_by="operator")
+
+                    if result.success:
+                        logger.info(
+                            "Approved remediation completed successfully",
+                            action_id=action_id,
+                            pod=diagnosis.symptom.pod_name,
+                            output=result.output,
+                        )
+                        # Emit fix_applied event
+                        try:
+                            import asyncio
+                            from k8s_agent.dashboard.api import app
+                            fix_event = {
+                                "event_type": "fix_applied",
+                                "timestamp": datetime.utcnow().isoformat() + "Z",
+                                "resource": {
+                                    "namespace": diagnosis.symptom.namespace,
+                                    "kind": "Pod",
+                                    "name": diagnosis.symptom.pod_name
+                                },
+                                "severity": "info",
+                                "payload": {
+                                    "action_id": action_id,
+                                    "remediation_type": diagnosis.remediation_type.value,
+                                    "output": result.output,
+                                    "dry_run": result.dry_run
+                                }
+                            }
+                            try:
+                                loop = asyncio.get_event_loop()
+                            except RuntimeError:
+                                loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(loop)
+                            if loop.is_running():
+                                asyncio.run_coroutine_threadsafe(
+                                    app.state.emit_event(
+                                        "fix_applied",
+                                        fix_event["resource"],
+                                        fix_event["severity"],
+                                        fix_event["payload"]
+                                    ),
+                                    loop
+                                )
+                            else:
+                                loop.run_until_complete(
+                                    app.state.emit_event(
+                                        "fix_applied",
+                                        fix_event["resource"],
+                                        fix_event["severity"],
+                                        fix_event["payload"]
+                                    )
+                                )
+                        except Exception as e:
+                            logger.error("Failed to emit fix_applied event", action_id=action_id, error=str(e))
+                    else:
+                        logger.error(
+                            "Approved remediation failed",
+                            action_id=action_id,
+                            pod=diagnosis.symptom.pod_name,
+                            error=result.error,
+                        )
+                        # Emit fix_failed event
+                        try:
+                            import asyncio
+                            from k8s_agent.dashboard.api import app
+                            fail_event = {
+                                "event_type": "fix_failed",
+                                "timestamp": datetime.utcnow().isoformat() + "Z",
+                                "resource": {
+                                    "namespace": diagnosis.symptom.namespace,
+                                    "kind": "Pod",
+                                    "name": diagnosis.symptom.pod_name
+                                },
+                                "severity": "high",
+                                "payload": {
+                                    "action_id": action_id,
+                                    "remediation_type": diagnosis.remediation_type.value,
+                                    "error": result.error
+                                }
+                            }
+                            try:
+                                loop = asyncio.get_event_loop()
+                            except RuntimeError:
+                                loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(loop)
+                            if loop.is_running():
+                                asyncio.run_coroutine_threadsafe(
+                                    app.state.emit_event(
+                                        "fix_failed",
+                                        fail_event["resource"],
+                                        fail_event["severity"],
+                                        fail_event["payload"]
+                                    ),
+                                    loop
+                                )
+                            else:
+                                loop.run_until_complete(
+                                    app.state.emit_event(
+                                        "fix_failed",
+                                        fail_event["resource"],
+                                        fail_event["severity"],
+                                        fail_event["payload"]
+                                    )
+                                )
+                        except Exception as e:
+                            logger.error("Failed to emit fix_failed event", action_id=action_id, error=str(e))
+
+                    policy_engine.record_action_result(
+                        action_id=action_id,
+                        success=result.success
+                    )
+                    policy_engine.complete_action(
+                        action_id,
+                        success=result.success,
+                        error=result.error,
+                    )
+                except Exception as e:
+                    logger.error("Error executing approved action", action_id=action_id, error=str(e), exc_info=True)
 
             # Sleep before next watch cycle
             logger.debug("Watch cycle complete, sleeping", seconds=settings.watcher.watch_interval_seconds)
